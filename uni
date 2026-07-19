@@ -28,6 +28,7 @@ UNI_ICON_DIR="$REAL_HOME/.local/share/uni/icons"
 UNI_CACHE_DIR="$REAL_HOME/.cache/uni"
 UNI_CACHE_TTL=3600          # 1 hour for search cache
 UNI_UPDATE_CHECK_TTL=86400  # 24 hours for update-notifier check
+UNI_JSON_SCHEMA_VERSION=1
 
 # ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -231,6 +232,442 @@ else:
     for name, info in sorted(d.items()):
         print(f"  {name:<32} [{info['backend']:<10}]  {info['id']}")
 PYEOF
+}
+
+# ── JSON helpers ─────────────────────────────────────────────
+json_event() {
+    local event="$1" state="$2" progress="$3" message="$4" package="${5:-}" source="${6:-}" exit_code="${7:-}"
+    python3 - "$event" "$state" "$progress" "$message" "$package" "$source" "$exit_code" << 'PYEOF'
+import json, re, sys, time
+event, state, progress, message, package, source, exit_code = sys.argv[1:8]
+ansi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+message = ansi.sub("", message)
+obj = {
+    "schemaVersion": 1,
+    "event": event,
+    "state": state,
+    "progress": int(progress),
+    "message": message,
+    "timestamp": int(time.time()),
+}
+if package:
+    obj["package"] = package
+if source:
+    obj["source"] = source
+if exit_code:
+    obj["exitCode"] = int(exit_code)
+print(json.dumps(obj, separators=(",", ":")), flush=True)
+PYEOF
+}
+
+cmd_installed_json() {
+    init_registry
+    python3 - "$UNI_REGISTRY" << 'PYEOF'
+import json, os, subprocess, sys
+reg_path = sys.argv[1]
+items = []
+
+try:
+    with open(reg_path) as f:
+        registry = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    registry = {}
+
+for name, info in sorted(registry.items()):
+    items.append({
+        "name": name,
+        "id": info.get("id", ""),
+        "source": info.get("backend", ""),
+        "managedByUni": True,
+        "installed": True,
+    })
+
+try:
+    fp = subprocess.run(
+        ["flatpak", "list", "--app", "--columns=application,name,version,origin"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False
+    )
+    if fp.returncode == 0:
+        for line in fp.stdout.splitlines():
+            cols = line.split("\t")
+            if not cols or not cols[0].strip():
+                continue
+            app_id = cols[0].strip()
+            if any(i["id"] == app_id or i["name"].lower() == app_id.lower() for i in items):
+                continue
+            items.append({
+                "name": (cols[1].strip() if len(cols) > 1 and cols[1].strip() else app_id),
+                "id": app_id,
+                "source": "flatpak",
+                "version": (cols[2].strip() if len(cols) > 2 and cols[2].strip() else None),
+                "origin": (cols[3].strip() if len(cols) > 3 and cols[3].strip() else None),
+                "managedByUni": False,
+                "installed": True,
+            })
+except FileNotFoundError:
+    pass
+
+print(json.dumps({
+    "schemaVersion": 1,
+    "items": sorted(items, key=lambda item: item["name"].lower()),
+}, separators=(",", ":")))
+PYEOF
+}
+
+cmd_search_json() {
+    local query="" sources="apt,flatpak,github"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) shift ;;
+            --source|-s)
+                shift
+                sources="${1:-}"
+                shift || true
+                ;;
+            --source=*)
+                sources="${1#*=}"
+                shift
+                ;;
+            *)
+                if [[ -z "$query" ]]; then
+                    query="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    [[ -z "$query" ]] && die "Usage: uni search <query> --json [--source apt|flatpak|github|snap]"
+
+    python3 - "$query" "$sources" << 'PYEOF'
+import json, subprocess, sys, urllib.parse, urllib.request
+
+query = sys.argv[1]
+sources = {s.strip().lower() for s in sys.argv[2].replace(";", ",").split(",") if s.strip()}
+if "system" in sources:
+    sources.add("apt")
+if "flathub" in sources:
+    sources.add("flatpak")
+if not sources:
+    sources = {"apt", "flatpak", "github"}
+
+results = []
+providers = []
+
+def add_provider(source, state, message=None):
+    providers.append({"source": source, "state": state, "message": message})
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=8)
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired as exc:
+        return exc
+
+if "apt" in sources:
+    policy = run(["apt-cache", "policy", query])
+    if policy is None:
+        add_provider("apt", "missing", "apt-cache not found")
+    elif isinstance(policy, subprocess.TimeoutExpired):
+        add_provider("apt", "failed", "apt-cache timed out")
+    else:
+        candidate = ""
+        for line in policy.stdout.splitlines():
+            if "Candidate:" in line:
+                candidate = line.split("Candidate:", 1)[1].strip()
+                break
+        if candidate and candidate != "(none)":
+            show = run(["apt-cache", "show", query])
+            summary = "System package"
+            if show and not isinstance(show, subprocess.TimeoutExpired):
+                for line in show.stdout.splitlines():
+                    if line.startswith("Description:"):
+                        summary = line.split(":", 1)[1].strip()
+                        break
+            results.append({
+                "id": query,
+                "name": query,
+                "summary": summary,
+                "source": "apt",
+                "packageId": query,
+                "version": candidate,
+                "verified": True,
+                "trust": "system_access",
+                "command": ["uni", "install", query, "--source", "apt"],
+            })
+        add_provider("apt", "ready")
+
+if "flatpak" in sources:
+    fp = run(["flatpak", "search", "--columns=application,name,description", query])
+    if fp is None:
+        add_provider("flatpak", "missing", "flatpak not found")
+    elif isinstance(fp, subprocess.TimeoutExpired):
+        add_provider("flatpak", "failed", "flatpak search timed out")
+    else:
+        if fp.returncode == 0:
+            for line in fp.stdout.splitlines():
+                cols = line.split("\t")
+                if len(cols) < 1 or not cols[0].strip():
+                    continue
+                app_id = cols[0].strip()
+                if app_id.lower() == "no matches found":
+                    continue
+                name = cols[1].strip() if len(cols) > 1 and cols[1].strip() else app_id
+                summary = cols[2].strip() if len(cols) > 2 and cols[2].strip() else "Flatpak application"
+                results.append({
+                    "id": app_id,
+                    "name": name,
+                    "summary": summary,
+                    "source": "flatpak",
+                    "packageId": app_id,
+                    "verified": True,
+                    "trust": "sandboxed",
+                    "command": ["uni", "install", app_id, "--source", "flatpak"],
+                })
+            add_provider("flatpak", "ready")
+        else:
+            add_provider("flatpak", "failed", fp.stderr.strip() or "flatpak search failed")
+
+if "snap" in sources:
+    snap = run(["snap", "find", query])
+    if snap is None:
+        add_provider("snap", "missing", "snap not found")
+    elif isinstance(snap, subprocess.TimeoutExpired):
+        add_provider("snap", "failed", "snap find timed out")
+    else:
+        if snap.returncode == 0:
+            for line in snap.stdout.splitlines()[1:6]:
+                cols = line.split()
+                if cols:
+                    results.append({
+                        "id": cols[0],
+                        "name": cols[0],
+                        "summary": "Snap package",
+                        "source": "snap",
+                        "packageId": cols[0],
+                        "verified": False,
+                        "trust": "system_access",
+                        "command": ["uni", "install", cols[0], "--source", "snap"],
+                    })
+            add_provider("snap", "ready")
+        else:
+            add_provider("snap", "failed", snap.stderr.strip() or "snap find failed")
+
+if "github" in sources:
+    try:
+        url = "https://api.github.com/search/repositories?q=" + urllib.parse.quote(query + " in:name") + "&sort=stars&per_page=5"
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "uni-json/1",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for item in data.get("items", [])[:5]:
+            repo = item.get("full_name", "")
+            if not repo:
+                continue
+            results.append({
+                "id": repo,
+                "name": item.get("name") or repo,
+                "summary": item.get("description") or "GitHub release",
+                "source": "github",
+                "packageId": repo,
+                "verified": False,
+                "trust": "unverified",
+                "stars": item.get("stargazers_count", 0),
+                "homepage": item.get("homepage") or item.get("html_url"),
+                "command": ["uni", "install", repo, "--source", "github"],
+            })
+        add_provider("github", "ready")
+    except Exception as exc:
+        add_provider("github", "failed", str(exc))
+
+print(json.dumps({
+    "schemaVersion": 1,
+    "query": query,
+    "results": results,
+    "providers": providers,
+}, separators=(",", ":")))
+PYEOF
+}
+
+cmd_info_json() {
+    local pkg="" source=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) shift ;;
+            --source|-s)
+                shift
+                source="${1:-}"
+                shift || true
+                ;;
+            --source=*)
+                source="${1#*=}"
+                shift
+                ;;
+            *)
+                if [[ -z "$pkg" ]]; then
+                    pkg="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    [[ -z "$pkg" ]] && die "Usage: uni info <id> --source <source> --json"
+    [[ -z "$source" ]] && source="auto"
+
+    python3 - "$pkg" "$source" << 'PYEOF'
+import json, subprocess, sys, urllib.request
+
+pkg, source = sys.argv[1], sys.argv[2].lower()
+obj = {
+    "schemaVersion": 1,
+    "id": pkg,
+    "packageId": pkg,
+    "source": source,
+    "name": pkg,
+    "installed": False,
+    "metadata": {},
+}
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=8)
+    except Exception:
+        return None
+
+if source in ("apt", "system", "auto"):
+    dpkg = run(["dpkg-query", "-W", "-f=${Package}\t${Version}\t${binary:Summary}\n", pkg])
+    if dpkg and dpkg.returncode == 0 and dpkg.stdout.strip():
+        cols = dpkg.stdout.split("\t")
+        obj.update({"source": "apt", "installed": True, "version": cols[1].strip() if len(cols) > 1 else None})
+        obj["summary"] = cols[2].strip() if len(cols) > 2 else "System package"
+    show = run(["apt-cache", "show", pkg])
+    if show and show.returncode == 0:
+        for line in show.stdout.splitlines():
+            if line.startswith("Description:") and "summary" not in obj:
+                obj["summary"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Homepage:"):
+                obj["homepage"] = line.split(":", 1)[1].strip()
+            elif line.startswith("License:"):
+                obj["license"] = line.split(":", 1)[1].strip()
+
+if source in ("flatpak", "flathub", "auto"):
+    fp = run(["flatpak", "info", pkg])
+    if fp and fp.returncode == 0:
+        obj.update({"source": "flatpak", "installed": True, "trust": "sandboxed"})
+        for line in fp.stdout.splitlines():
+            if ":" not in line:
+                continue
+            key, value = [part.strip() for part in line.split(":", 1)]
+            obj["metadata"][key] = value
+            if key.lower() == "version":
+                obj["version"] = value
+    if source in ("flatpak", "flathub") and "summary" not in obj:
+        search = run(["flatpak", "search", "--columns=application,name,description", pkg])
+        if search and search.returncode == 0:
+            for line in search.stdout.splitlines():
+                cols = line.split("\t")
+                if cols and cols[0].strip() == pkg:
+                    obj["name"] = cols[1].strip() if len(cols) > 1 and cols[1].strip() else pkg
+                    obj["summary"] = cols[2].strip() if len(cols) > 2 and cols[2].strip() else "Flatpak application"
+                    obj["source"] = "flatpak"
+                    obj["trust"] = "sandboxed"
+                    break
+
+if source in ("github", "gh"):
+    obj.update({"source": "github", "trust": "unverified"})
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{pkg}/releases/latest", headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "uni-json/1",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        obj["version"] = data.get("tag_name")
+        obj["summary"] = data.get("name") or "Latest GitHub release"
+        obj["assets"] = [
+            {
+                "name": a.get("name"),
+                "size": a.get("size"),
+                "downloadUrl": a.get("browser_download_url"),
+            }
+            for a in data.get("assets", [])
+        ]
+    except Exception as exc:
+        obj["error"] = str(exc)
+
+print(json.dumps(obj, separators=(",", ":")))
+PYEOF
+}
+
+cmd_updates_json() {
+    python3 - << 'PYEOF'
+import json
+print(json.dumps({
+    "schemaVersion": 1,
+    "items": [],
+    "providers": [
+        {"source": "apt", "state": "not_implemented", "message": "Structured update discovery is not implemented yet"},
+        {"source": "flatpak", "state": "not_implemented", "message": "Structured update discovery is not implemented yet"},
+        {"source": "github", "state": "not_implemented", "message": "Structured update discovery is not implemented yet"},
+    ],
+}, separators=(",", ":")))
+PYEOF
+}
+
+cmd_json_events_wrapper() {
+    local action="$1"
+    shift
+
+    local args=()
+    local pkg="" source=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json-events)
+                shift
+                ;;
+            --source|-s)
+                args+=("$1")
+                shift
+                source="${1:-}"
+                args+=("${1:-}")
+                shift || true
+                ;;
+            --source=*)
+                source="${1#*=}"
+                args+=("$1")
+                shift
+                ;;
+            *)
+                [[ -z "$pkg" ]] && pkg="$1"
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    json_event "queued" "queued" 0 "Queued ${action}" "$pkg" "$source"
+    json_event "started" "running" 5 "Starting ${action}" "$pkg" "$source"
+
+    local tmp rc
+    tmp=$(mktemp)
+    if "$0" "$action" "${args[@]}" >"$tmp" 2>&1; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && json_event "log" "running" 50 "$line" "$pkg" "$source"
+        done < "$tmp"
+        rm -f "$tmp"
+        json_event "succeeded" "succeeded" 100 "${action} completed" "$pkg" "$source" 0
+        return 0
+    else
+        rc=$?
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && json_event "log" "failed" 90 "$line" "$pkg" "$source"
+        done < "$tmp"
+        rm -f "$tmp"
+        json_event "failed" "failed" 100 "${action} failed" "$pkg" "$source" "$rc"
+        return "$rc"
+    fi
 }
 
 # ── Backend detection ────────────────────────────────────────
@@ -1701,7 +2138,12 @@ cmd_help() {
     echo -e "  ${BOLD}uni install${RESET} <url.AppImage>           Download & install AppImage"
     echo -e "  ${BOLD}uni remove${RESET}  <package>                Remove (keep config)"
     echo -e "  ${BOLD}uni purge${RESET}   <package>                Remove + all config/data"
-        echo -e "  ${BOLD}uni list${RESET}                             List uni-managed packages"
+    echo -e "  ${BOLD}uni list${RESET}                             List uni-managed packages"
+    echo -e "  ${BOLD}uni search${RESET} <query> ${CYAN}--json${RESET}             Search sources as JSON"
+    echo -e "  ${BOLD}uni info${RESET} <id> ${CYAN}--source${RESET} <src> ${CYAN}--json${RESET}  Show package info as JSON"
+    echo -e "  ${BOLD}uni installed${RESET} ${CYAN}--json${RESET}                  List installed apps as JSON"
+    echo -e "  ${BOLD}uni updates${RESET} ${CYAN}--json${RESET}                    List available updates as JSON"
+    echo -e "  ${BOLD}uni install${RESET} <pkg> ${CYAN}--json-events${RESET}       Emit JSON lifecycle events"
     echo -e "  ${BOLD}uni update${RESET}                           Update all backends"
     echo -e "  ${BOLD}uni self-update${RESET}                      Update uni itself"
     echo -e "  ${BOLD}uni uninstall${RESET}                        Remove uni completely"
@@ -1716,16 +2158,43 @@ cmd_help() {
 
 # ── Entry point ──────────────────────────────────────────────
 main() {
-    # Kick off background update check on every run (non-blocking)
-    check_for_update
-
     local cmd="${1:-help}"
     shift || true
+
+    # Machine-readable commands must not print banners, colors, or update notices.
+    case "$cmd" in
+        search)
+            if [[ " $* " == *" --json "* ]]; then cmd_search_json "$@"; return; fi
+            ;;
+        info)
+            if [[ " $* " == *" --json "* ]]; then cmd_info_json "$@"; return; fi
+            ;;
+        installed)
+            if [[ $# -eq 0 || " $* " == *" --json "* ]]; then cmd_installed_json "$@"; return; fi
+            ;;
+        updates)
+            if [[ $# -eq 0 || " $* " == *" --json "* ]]; then cmd_updates_json "$@"; return; fi
+            ;;
+        list)
+            if [[ " $* " == *" --json "* ]]; then cmd_installed_json "$@"; return; fi
+            ;;
+        install|remove|update)
+            if [[ " $* " == *" --json-events "* ]]; then cmd_json_events_wrapper "$cmd" "$@"; return; fi
+            ;;
+    esac
+
+    # Kick off background update check on human-readable runs only.
+    check_for_update
+
     case "$cmd" in
         install)                cmd_install "$@" ;;
         remove)                 cmd_remove  "$@" ;;
         purge)                  cmd_purge   "$@" ;;
         list)                   cmd_list ;;
+        search)                 [[ $# -gt 0 ]] && cmd_search_json "$@" --json || die "Usage: uni search <query> --json" ;;
+        info)                   [[ $# -gt 0 ]] && cmd_info_json "$@" --json || die "Usage: uni info <id> --source <source> --json" ;;
+        installed)              cmd_installed_json ;;
+        updates)                cmd_updates_json ;;
         update)                 cmd_update ;;
         self-update|--update)   cmd_self_update "$@" ;;
         uninstall)              cmd_uninstall ;;
